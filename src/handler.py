@@ -2,9 +2,10 @@ import os
 import time
 import uuid
 import boto3
-from datetime import datetime
+from datetime import datetime, timedelta
 from random import shuffle
 from boto3.dynamodb.conditions import Key, Attr
+from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
 usersTable = dynamodb.Table('Users')
@@ -12,7 +13,7 @@ rewardsTable = dynamodb.Table('Rewards')
 questsTable = dynamodb.Table('Quests')
 dailyActivitiesTable = dynamodb.Table('DailyActivities')
 
-default_error_message = "mister bob is out of town today. please try again later."
+default_error_message = "mister bob is confused. please try again later."
 
 daily_completed_activities_max = 3
 
@@ -72,7 +73,7 @@ class User:
         self.firstName = firstName
         self.birthDate = birthDate
         self.rewardPoints = rewardPoints
-        self.age = datetime.today().year - datetime.strptime(birthDate, '%Y-%m-%d').year
+        self.age = cur_local_datetime().year - datetime.strptime(birthDate, '%Y-%m-%d').year
 
 class Quest:
     def __init__(self, id, description, qualifiedAge, rewardPoints):
@@ -80,6 +81,22 @@ class Quest:
         self.description = description
         self.qualifiedAge = qualifiedAge
         self.rewardPoints = rewardPoints
+
+class Reward:
+    def __init__(self, id, description, rewardPoints):
+        self.id = id
+        self.description = description
+        self.rewardPoints = rewardPoints
+
+def find_all_rewards():
+    results = rewardsTable.scan()
+
+    rewards = []
+    for result in results['Items']:
+        reward = Reward(result['Id'],result['Description'],result['RewardPoints'])
+        rewards.append(reward)
+
+    return rewards
 
 def find_all_qualified_quest(age, completedActivities):
     results = questsTable.scan()
@@ -184,14 +201,18 @@ def find_incompleted_daily_activities(userId,curDateStr):
     return incompleted
 
 ## app logic
+def cur_local_datetime():
+    # get local us/east time
+    return datetime.now() - timedelta(hours=7)
+
 def generate_user_id(name, requestUserId):
     return name.lower() + '@' + requestUserId
 
 def generate_activity_id(userId):
-    return userId + '@' + datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+    return userId + '@' + cur_local_datetime().strftime('%Y-%m-%d-%H-%M-%S')
 
 def get_daily_quest_for_user(name, userId):
-    curDateStr = datetime.today().strftime('%Y-%m-%d')
+    curDateStr = cur_local_datetime().strftime('%Y-%m-%d')
     activityId = generate_activity_id(userId)
 
     speah_text = ""
@@ -231,7 +252,7 @@ def get_daily_quest_for_user(name, userId):
         card_title, speah_text, None, should_end_session))
 
 def claim_quest_complete_for_user(name, userId):
-    curDateStr = datetime.today().strftime('%Y-%m-%d')
+    curDateStr = cur_local_datetime().strftime('%Y-%m-%d')
     activityId = generate_activity_id(userId)
 
     speah_text = ""
@@ -276,6 +297,57 @@ def query_reward_points_for_user(name, userId):
     return build_response(session_attributes, build_speechlet_response(
         card_title, speah_text, None, should_end_session))
 
+def query_reward_options_for_user(name, userId):
+    speah_text = ""
+
+    user = find_user(userId)
+    if user == None:
+        speah_text = default_error_message
+    else:
+        rewards = find_all_rewards()
+        speah_text = "mister bob has the following rewards. "
+        for reward in rewards:
+            speah_text = speah_text + " " + reward.description + " for " + str(reward.rewardPoints) + " points. "
+
+        available_rewards = []
+        for reward in rewards:
+            if reward.rewardPoints <= user.rewardPoints:
+                available_rewards.append(reward)
+        
+        if len(available_rewards) == 0:
+             speah_text = speah_text + " " + name + " does not have enough reward points for anything."
+        else:
+            speah_text = speah_text + " " + name + " can get either "
+            for reward in available_rewards:
+                speah_text = speah_text + reward.description + ", or "
+            speah_text = speah_text + " a combination of some of those."
+
+    session_attributes = {}
+    card_title = "RewardOptionQuery"
+    should_end_session = True
+    return build_response(session_attributes, build_speechlet_response(
+        card_title, speah_text, None, should_end_session))
+
+def user_reward_points_for_user(name, userId, points):
+    speah_text = ""
+
+    user = find_user(userId)
+    if user == None:
+        speah_text = default_error_message
+    else:
+        if user.rewardPoints < points:
+            speah_text = name + " only has " + str(user.rewardPoints) + " points in total. it is less then " + str(points) + " points."
+        else:
+            user.rewardPoints = user.rewardPoints - points
+            update_user_reward_points(user)
+            speah_text = name + " used " + str(points) + " points. now " + name + " has " + str(user.rewardPoints) + " points left. enjoy."
+
+    session_attributes = {}
+    card_title = "RewardPointsQuery"
+    should_end_session = True
+    return build_response(session_attributes, build_speechlet_response(
+        card_title, speah_text, None, should_end_session))
+
 def lambda_handler(event, context):
     request_user_id = event['context']['System']['user']['userId']
     
@@ -292,4 +364,11 @@ def lambda_handler(event, context):
     if intent_name == "QueryRewardPoints":
         firstName = intent_request['intent']['slots']['firstname']['value']
         return query_reward_points_for_user(firstName, generate_user_id(firstName, request_user_id))
+    if intent_name == "QueryRewardOptions":
+        firstName = intent_request['intent']['slots']['firstname']['value']
+        return query_reward_options_for_user(firstName, generate_user_id(firstName, request_user_id))
+    if intent_name == "UseRewardPoints":
+        firstName = intent_request['intent']['slots']['firstname']['value']
+        points = Decimal(intent_request['intent']['slots']['points']['value'])
+        return user_reward_points_for_user(firstName, generate_user_id(firstName, request_user_id), points)
         
